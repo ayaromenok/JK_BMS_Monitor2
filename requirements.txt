@@ -1,0 +1,4 @@
+# JK BMS CLI Requirements
+aiobmsble
+bleak
+bleak-retry-connector
