@@ -1,0 +1,6 @@
+- stay connected to Bluetooth BMS isntead of relogin on every ineration
+- add '--watch' option as alternative to '--count 0'
+- add option to setup BLE MAC address and BLE/BMS serail number
+- add options to select MQTT server settings
+- display current values to servcie status (i.e. `systemctl status jk_bms__monitor_py`)
+- update and cleanup README.md
