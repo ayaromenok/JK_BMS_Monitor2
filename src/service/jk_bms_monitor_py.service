@@ -2,7 +2,7 @@
 Description=JK BMS Battery service
 
 [Service]
-ExecStart=python /home/pi/projects/JK_BMS_Monitor2/src/py/jk_bms_monitor.py --interval 30 --count 0
+ExecStart=/home/pi/sdk/venv/py313/bin/python /home/pi/projects/JK_BMS_Monitor2/src/py/jk_bms_monitor.py --interval 30 --count 0
 
 [Install]
 WantedBy=multi-user.target
