@@ -26,7 +26,12 @@ python3 src/py/jk_bms_monitor.py                  # one read: print + publish
 python3 src/py/jk_bms_monitor.py --interval 10    # continuous, every 10 s
 python3 src/py/jk_bms_monitor.py --count 5 --interval 5
 python3 src/py/jk_bms_monitor.py --no-mqtt        # BLE only
+python3 src/py/jk_bms_monitor.py --interval 10 --reconnect  # old slow mode: re-login every read
 ```
+
+By default the BLE connection to the BMS is established once and kept open
+between reads; a dropped link is re-established transparently. `--reconnect`
+restores the legacy behaviour of disconnecting after every read (for debugging).
 
 Verify the MQTT side:
 

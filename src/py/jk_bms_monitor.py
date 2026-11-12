@@ -8,25 +8,32 @@ all of them to the local Mosquitto broker.
 Based on the official aiobmsble example:
     https://github.com/patman15/aiobmsble/blob/main/examples/minimal.py
 
+The BLE connection is established once and kept open, so repeated reads do not
+have to redo connect + GATT discovery + notification setup on every cycle.
+
 Usage:
     python3 src/py/jk_bms_monitor.py                 # single read, print + publish
     python3 src/py/jk_bms_monitor.py --interval 10   # keep reading every 10 s
     python3 src/py/jk_bms_monitor.py --no-mqtt       # BLE only (debug)
+    python3 src/py/jk_bms_monitor.py --interval 10 --reconnect   # old behaviour:
+                                                   # disconnect after each read
 """
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
-from typing import Any, Final
+import signal
+from typing import Any, Final, Self
 
 import paho.mqtt.client as mqtt
 from bleak import BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
-from aiobmsble import BMSSample
+from aiobmsble import BMSConfig, BMSSample
 from aiobmsble.bms.jikong_bms import BMS  # JK / Jikong smart BMS
 
 # ------------------------------------------------------------------ config ---
@@ -164,27 +171,145 @@ def print_report(dev_info: dict[str, Any], data: dict[str, Any]) -> None:
     print("=" * 60)
 
 
-async def read_bms() -> tuple[dict[str, Any], dict[str, Any]]:
-    """Scan for the JK BMS, query it once and return (device_info, flattened data)."""
+def _install_stop_handlers(stop: asyncio.Event) -> None:
+    """Stop the read loop on SIGINT/SIGTERM so the BLE link is released cleanly.
+
+    Without this, a SIGTERM (what systemd sends on service stop) kills the
+    process without running the cleanup, leaving a dangling BLE connection on
+    the controller. The BMS then keeps holding the link, stops advertising
+    and the next start cannot find it in the scan.
+    """
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.add_signal_handler(sig, stop.set)
+
+
+async def find_bms_device() -> BLEDevice:
+    """Scan for the JK BMS and return the found BLE device."""
     device: BLEDevice | None = await BleakScanner.find_device_by_address(
         BMS_ADDRESS, timeout=SCAN_TIMEOUT
     )
     if device is None:
         raise ConnectionError(f"BLE device {BMS_ADDRESS} not found (scan {SCAN_TIMEOUT:.0f} s)")
     logger.info("Found device: %s (%s)", device.name, device.address)
+    return device
 
-    async with BMS(ble_device=device) as bms:
-        dev_info: dict[str, Any] = await bms.device_info()
-        sample: BMSSample = await bms.async_update()
 
-    # the BMS device-info frame carries only 8 chars of the serial,
-    # the full one (BMS_SERIAL) is broadcast in the BLE advertised name
-    serial: str = dev_info.get("serial_number", "")
-    if BMS_SERIAL not in (device.name or "") and not BMS_SERIAL.startswith(serial):
-        logger.warning("Serial mismatch: BMS reports '%s'/'%s', expected '%s'",
-                       device.name, serial, BMS_SERIAL)
-    dev_info["serial_number"] = BMS_SERIAL
-    return dev_info, flatten(sample)
+class BmsLink:
+    """BLE link to the BMS that stays connected between reads.
+
+    The connection (link setup, GATT discovery, notification setup and the
+    "BMS ready" handshake) is established once by the first `read()` and then
+    reused by all following reads (`BMSConfig(keep_alive=True)`), instead of a
+    full re-login for every sample.  A link that got dropped by the BMS or the
+    adapter is re-established transparently by the next read.
+
+    Use it as an async context manager so the link is always closed again::
+
+        async with BmsLink() as link:
+            data = flatten(await link.read())
+    """
+
+    def __init__(self, keep_alive: bool = True) -> None:
+        self._keep_alive: Final[bool] = keep_alive
+        self._stack: Final[contextlib.AsyncExitStack] = contextlib.AsyncExitStack()
+        self._device: BLEDevice | None = None
+        self._bms: BMS | None = None
+        self._entered: bool = False
+        #: device info, read once when the link is established
+        self.dev_info: dict[str, Any] = {}
+
+    @property
+    def connected(self) -> bool:
+        """True while the BLE connection to the BMS is up."""
+        return self._bms is not None and self._bms.is_connected
+
+    # ------------------------------------------------------ context manager ---
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.close()
+
+    # --------------------------------------------------------------- public ---
+    async def read(self) -> BMSSample:
+        """Return one fresh sample, connecting / reconnecting as needed."""
+        bms: BMS = await self._ensure()
+        return await bms.async_update()
+
+    async def reset(self) -> None:
+        """Force-close a possibly half-dead link; next `read()` scans again."""
+        await self.close(reset=True)
+        self._device = None
+        self.dev_info = {}
+
+    async def close(self, reset: bool = False) -> None:
+        """Disconnect the BMS (idempotent); `reset` also drops stale links."""
+        bms, self._bms = self._bms, None
+        if bms is None:
+            return
+        try:
+            if reset:
+                await bms.disconnect(reset=True)
+            if self._entered:
+                self._entered = False
+                await self._stack.aclose()  # leaves `async with BMS(...)` -> disconnect
+            elif bms.is_connected:
+                await bms.disconnect()
+        except (BleakError, TimeoutError, OSError) as exc:
+            logger.warning("BMS disconnect failed: %s: %s", type(exc).__name__, exc)
+
+    # ------------------------------------------------------------ internals ---
+    async def _ensure(self) -> BMS:
+        """Return a BMS instance with an open connection, creating it on demand."""
+        bms = self._bms
+        if bms is not None:
+            if not self.connected and self._keep_alive:
+                logger.info("BMS link lost - reconnecting %s", BMS_ADDRESS)
+            # a dropped link is re-established by `async_update()` itself
+            return bms
+
+        self._device = await find_bms_device()
+        bms = BMS(
+            ble_device=self._device,
+            config=BMSConfig(keep_alive=self._keep_alive),
+        )
+        try:
+            if self._keep_alive:
+                # entering the context connects and keeps the link up until close()
+                bms = await self._stack.enter_async_context(bms)
+                self._entered = True
+            self._bms = bms
+            await self._read_dev_info(bms)
+        except (BleakError, TimeoutError, ValueError, ConnectionError):
+            await self.reset()
+            raise
+
+        logger.info(
+            "Connected to BMS %s - %s",
+            BMS_ADDRESS,
+            "link stays open between reads" if self._keep_alive else "re-login on every read",
+        )
+        return bms
+
+    async def _read_dev_info(self, bms: BMS) -> None:
+        """Read (and sanity-check) the device information once per connection."""
+        try:
+            dev_info: dict[str, Any] = await bms.device_info()
+        except (BleakError, TimeoutError, ValueError) as exc:
+            logger.warning("device info unavailable: %s: %s", type(exc).__name__, exc)
+            return
+
+        # the BMS device-info frame carries only 8 chars of the serial,
+        # the full one (BMS_SERIAL) is broadcast in the BLE advertised name
+        name: str = (self._device.name if self._device else "") or ""
+        serial: str = dev_info.get("serial_number", "")
+        if BMS_SERIAL not in name and not BMS_SERIAL.startswith(serial):
+            logger.warning("Serial mismatch: BMS reports '%s'/'%s', expected '%s'",
+                           name, serial, BMS_SERIAL)
+        dev_info["serial_number"] = BMS_SERIAL
+        self.dev_info = dev_info
 
 
 async def main() -> None:
@@ -193,6 +318,9 @@ async def main() -> None:
                         help="seconds between reads (0 = single read)")
     parser.add_argument("--count", type=int, default=0,
                         help="stop after N reads (0 = unlimited)")
+    parser.add_argument("--reconnect", action="store_true",
+                        help="disconnect after each read instead of staying "
+                             "connected (slower, for debugging)")
     parser.add_argument("--no-mqtt", action="store_true", help="do not publish to MQTT")
     args = parser.parse_args()
 
@@ -204,23 +332,39 @@ async def main() -> None:
             logger.error("MQTT connect to %s:%s failed: %s", MQTT_HOST, MQTT_PORT, exc)
 
     reads: int = 0
+    errors: int = 0
+    stop: asyncio.Event = asyncio.Event()
+    _install_stop_handlers(stop)
     try:
-        while True:
-            try:
-                dev_info, data = await read_bms()
-                print_report(dev_info, data)
-                if client is not None:
-                    mqtt_publish(client, data)
-            except (BleakError, TimeoutError, ValueError, ConnectionError) as exc:
-                logger.error("BMS read failed: %s: %s", type(exc).__name__, exc)
+        async with BmsLink(keep_alive=not args.reconnect) as link:
+            while not stop.is_set():
+                try:
+                    data: dict[str, Any] = flatten(await link.read())
+                    errors = 0
+                    print_report(link.dev_info, data)
+                    if client is not None:
+                        mqtt_publish(client, data)
+                except (BleakError, TimeoutError, ValueError, ConnectionError) as exc:
+                    errors += 1
+                    logger.error("BMS read failed (#%d consecutive): %s: %s",
+                                 errors, type(exc).__name__, exc)
+                    # the link may be half-dead: close it cleanly, the next
+                    # iteration re-scans and re-connects from scratch
+                    await link.reset()
 
-            reads += 1
-            if args.count and reads >= args.count:
-                break
-            if args.interval <= 0:
-                break
-            await asyncio.sleep(args.interval)
+                reads += 1
+                if args.count and reads >= args.count:
+                    break
+                if args.interval <= 0:
+                    break
+                try:
+                    # wait for the interval, but wake up immediately on a stop signal
+                    await asyncio.wait_for(stop.wait(), timeout=args.interval)
+                except asyncio.TimeoutError:
+                    pass
     finally:
+        if stop.is_set():
+            logger.info("signal received - shutting down")
         if client is not None:
             client.publish(f"{MQTT_PREFIX}/availability", "offline", qos=0, retain=True)
             client.loop_stop()
