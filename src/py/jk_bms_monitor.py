@@ -41,7 +41,7 @@ BMS_ADDRESS: Final[str] = "C8:47:80:53:27:81"
 BMS_SERIAL: Final[str] = "512251N28000371"
 SCAN_TIMEOUT: Final[float] = 15.0
 
-MQTT_HOST: Final[str] = os.getenv("MQTT_HOST", "127.0.0.1")
+MQTT_HOST: Final[str] = os.getenv("MQTT_HOST", "192.168.1.100")
 MQTT_PORT: Final[int] = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USER: Final[str | None] = os.getenv("MQTT_USER") or None
 MQTT_PASS: Final[str | None] = os.getenv("MQTT_PASSWORD") or None
